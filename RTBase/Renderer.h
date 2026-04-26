@@ -508,7 +508,6 @@ public:
 	void renderWorker(unsigned int yStart, unsigned int yEnd, int threadID)
 	{
 		Sampler* sampler = &samplers[threadID];
-		lightTrace(sampler);
 		for (unsigned int y = yStart; y < yEnd; y++)
 		{
 			for (unsigned int x = 0; x < film->width; x++)
