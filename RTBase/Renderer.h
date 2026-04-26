@@ -30,7 +30,8 @@ public:
 		scene = _scene;
 		canvas = _canvas;
 		film = new Film();
-		film->init((unsigned int)scene->camera.width, (unsigned int)scene->camera.height, new MitchellNetravaliFilter());
+		film->init((unsigned int)scene->camera.width, (unsigned int)scene->camera.height, new BoxFilter());
+		//film->init((unsigned int)scene->camera.width, (unsigned int)scene->camera.height, new MitchellNetravaliFilter());
 		SYSTEM_INFO sysInfo;
 		GetSystemInfo(&sysInfo);
 		numProcs = sysInfo.dwNumberOfProcessors;
@@ -56,7 +57,7 @@ public:
 			return Colour(0.0f, 0.0f, 0.0f);
 		}
 		// Compute direct lighting here
-		float lightPMF = 0.0f;
+		float lightPMF = 0;
 		Light* light = scene->sampleLight(sampler, lightPMF);
 		if (light == NULL || lightPMF <= 0)
 		{
@@ -116,6 +117,132 @@ public:
 		}
 		return Colour(0.0f, 0.0f, 0.0f);
 	}
+	Colour computeDirectMIS(ShadingData shadingData, Sampler* sampler)
+	{
+		// Is surface is specular we cannot computing direct lighting
+		if (shadingData.bsdf->isPureSpecular() == true)
+		{
+			return Colour(0.0f, 0.0f, 0.0f);
+		}
+		// Compute direct lighting here
+		float lightPMF = 0;
+		Light* light = scene->sampleLight(sampler, lightPMF);
+		if (light == NULL || lightPMF <= 0)
+		{
+			return Colour(0.0f, 0.0f, 0.0f);
+		}
+		Colour emitted(0.0f, 0.0f, 0.0f);
+		float lightPDF = 0;
+		Vec3 lightSample = light->sample(shadingData, sampler, emitted, lightPDF);
+		if (lightPDF <= 0 || emitted.Lum() <= 0)
+		{
+			return Colour(0.0f, 0.0f, 0.0f);
+		}
+		if (light->isArea())
+		{
+			Vec3 xLight = lightSample;
+			Vec3 d = xLight - shadingData.x;
+			float dist2 = Dot(d, d);
+			if (dist2 <= 0)
+			{
+				return Colour(0.0f, 0.0f, 0.0f);
+			}
+			Vec3 wi = d.normalize();
+			float cosSurface = Dot(shadingData.sNormal, wi);
+			if (cosSurface <= 0)
+			{
+				return Colour(0.0f, 0.0f, 0.0f);
+			}
+			Vec3 lightNormal = light->normal(shadingData, wi);
+			float cosLight = Dot(lightNormal, -wi);
+			if (cosLight <= 0)
+			{
+				return Colour(0.0f, 0.0f, 0.0f);
+			}
+			if (!scene->visible(shadingData.x, xLight))
+			{
+				return Colour(0.0f, 0.0f, 0.0f);
+			}
+			Colour f = shadingData.bsdf->evaluate(shadingData, wi);
+			float G = (cosSurface * cosLight) / dist2;
+			float p_A = lightPMF * lightPDF;
+			float p_o = shadingData.bsdf->PDF(shadingData, wi);
+			float pbsdf_A = p_o * G / cosSurface;
+			float wLight = computeMISWeight(p_A, pbsdf_A);
+			return (f * emitted) * G * (wLight / p_A);
+		}
+		else
+		{
+			Vec3 wi = lightSample;
+			float cosSurface = Dot(shadingData.sNormal, wi);
+			if (cosSurface <= 0)
+			{
+				return Colour(0.0f, 0.0f, 0.0f);
+			}
+			Vec3 farPoint = shadingData.x + wi * ((scene->bounds.max - scene->bounds.min).length() * 2.0f);
+			if (!scene->visible(shadingData.x, farPoint))
+			{
+				return Colour(0.0f, 0.0f, 0.0f);
+			}
+			Colour f = shadingData.bsdf->evaluate(shadingData, wi);
+			float p_o = lightPMF * lightPDF;
+			float pbsdf_o = shadingData.bsdf->PDF(shadingData, wi);
+			float wLight = computeMISWeight(p_o, pbsdf_o);
+			return (f * emitted) * cosSurface * (wLight / p_o);
+		}
+		return Colour(0.0f, 0.0f, 0.0f);
+	}
+	bool computeIndirectAndHitLight(Colour& col,Colour throughput, Ray& ray, ShadingData shadingData,float pdf)
+	{
+		IntersectionData nextIntersection = scene->traverse(ray);
+		if (nextIntersection.t < FLT_MAX)
+		{
+			ShadingData nextShadingData = scene->calculateShadingData(nextIntersection, ray);
+			if (nextShadingData.bsdf != NULL && nextShadingData.bsdf->isLight())
+			{
+				Colour Le = nextShadingData.bsdf->emit(nextShadingData, nextShadingData.wo);
+				float wIndirect = 1;
+				if (!shadingData.bsdf->isPureSpecular())
+				{
+					Vec3 xLight = nextShadingData.x;
+					Vec3 d = xLight - shadingData.x;
+					float dist2 = Dot(d, d);
+					if (dist2 > 0)
+					{
+						Vec3 dir = d.normalize();
+						float cosSurface = Dot(shadingData.sNormal, dir);
+						float cosLight = Dot(nextShadingData.sNormal, -dir);
+						if (cosSurface > 0.0f && cosLight > 0.0f)
+						{
+							float G = (cosSurface * cosLight) / dist2;
+							float pbsdf_A = pdf * G / cosSurface;
+							float p_A = 0;
+							if (!scene->lights.empty())
+							{
+								Triangle& lightTri = scene->triangles[nextIntersection.ID];
+								if (lightTri.area > 0)
+								{
+									float lightPMF = 1.0f / (float)scene->lights.size();
+									p_A = lightPMF * (1.0f / lightTri.area);
+								}
+							}
+							wIndirect = computeMISWeight(pbsdf_A, p_A);
+						}
+					}
+				}
+				Colour color = color + throughput * Le * wIndirect;
+				return true;
+			}
+		}
+		return false;
+	}
+	float computeMISWeight(float pa, float pb)
+	{
+		if (pa + pb < 0) {
+			return 0;
+		}
+		return pa / (pa+pb);
+	}
 	Colour pathTrace(Ray& r, Colour& pathThroughput, int depth, Sampler* sampler)
 	{
 		// Add pathtracer code here
@@ -137,7 +264,8 @@ public:
 				color = color + pathThroughput * shadingData.bsdf->emit(shadingData, shadingData.wo);
 			}
 		}
-		color = color + pathThroughput * computeDirect(shadingData, sampler);
+		//color = color + pathThroughput * computeDirect(shadingData, sampler);
+		color = color + pathThroughput * computeDirectMIS(shadingData, sampler);
 		if (depth >= 3)
 		{
 			float pCont = std::min(0.95f, pathThroughput.Lum());
@@ -177,6 +305,11 @@ public:
 				return color;
 			}
 			throughput = pathThroughput * reflectedColour * (cosTheta / pdf);
+		}
+		//MIS
+		if (computeIndirectAndHitLight(color,throughput, nextRay, shadingData, pdf))
+		{
+			return color;
 		}
 		color = color + pathTrace(nextRay, throughput, depth + 1, sampler);
 		return color;
@@ -369,35 +502,8 @@ public:
 				//unsigned char b = (unsigned char)(col.b * 255);
 				//film->tonemap(x, y, r, g, b,4.0f);
 				//canvas->draw(x, y, r, g, b);
-				int index = (y * film->width + x) * 3;
-				colorBuffer[index + 0] = col.r;
-				colorBuffer[index + 1] = col.g;
-				colorBuffer[index + 2] = col.b;
-				Ray albedoRay = scene->camera.generateRay(px, py);
-				Colour alb = albedo(albedoRay);
-				albedoBuffer[index + 0] = alb.r;
-				albedoBuffer[index + 1] = alb.g;
-				albedoBuffer[index + 2] = alb.b;
-				Ray normalRay = scene->camera.generateRay(px, py);
-				Colour nrm = viewNormals(normalRay);
-				normalBuffer[index + 0] = nrm.r;
-				normalBuffer[index + 1] = nrm.g;
-				normalBuffer[index + 2] = nrm.b;
 			}
 		}
-		//denoise();
-		//for (unsigned int y = 0; y < film->height; y++)
-		//{
-		//	for (unsigned int x = 0; x < film->width; x++) 
-		//	{
-		//		int index = (y * film->width + x) * 3;
-		//		Colour col(outputBuffer[index + 0], outputBuffer[index + 1], outputBuffer[index + 2]);
-		//		unsigned char r, g, b;
-		//		denoisetonemap(col,r,g,b,4.0f);
-		//		//film->tonemap(x, y, r, g, b, 4.0f);
-		//		canvas->draw(x, y, r, g, b);
-		//	}
-		//}
 	}
 	void renderWorker(unsigned int yStart, unsigned int yEnd, int threadID)
 	{
@@ -413,20 +519,6 @@ public:
 				Colour throughput(1.0f, 1.0f, 1.0f);
 				Colour col = pathTrace(ray, throughput, 0, sampler);
 				film->splat(px, py, col);
-				int index = (y * film->width + x) * 3;
-				colorBuffer[index + 0] = col.r;
-				colorBuffer[index + 1] = col.g;
-				colorBuffer[index + 2] = col.b;
-				Ray albedoRay = scene->camera.generateRay(px, py);
-				Colour alb = albedo(albedoRay);
-				albedoBuffer[index + 0] = alb.r;
-				albedoBuffer[index + 1] = alb.g;
-				albedoBuffer[index + 2] = alb.b;
-				Ray normalRay = scene->camera.generateRay(px, py);
-				Colour nrm = viewNormals(normalRay);
-				normalBuffer[index + 0] = nrm.r;
-				normalBuffer[index + 1] = nrm.g;
-				normalBuffer[index + 2] = nrm.b;
 			}
 		}
 	}
@@ -467,33 +559,6 @@ public:
 		{
 			lightTrace(samplers);
 		}
-		for (unsigned int y = 0; y < film->height; y++)
-		{
-			for (unsigned int x = 0; x < film->width; x++)
-			{
-				float px = x + 0.5f;
-				float py = y + 0.5f;
-				int index = (y * film->width + x) * 3;
-				Colour col = film->film[y * film->width + x];
-				if (film->SPP > 0)
-				{
-					col = col / (float)film->SPP;
-				}
-				colorBuffer[index + 0] = col.r;
-				colorBuffer[index + 1] = col.g;
-				colorBuffer[index + 2] = col.b;
-				Ray albedoRay = scene->camera.generateRay(px, py);
-				Colour alb = albedo(albedoRay);
-				albedoBuffer[index + 0] = alb.r;
-				albedoBuffer[index + 1] = alb.g;
-				albedoBuffer[index + 2] = alb.b;
-				Ray normalRay = scene->camera.generateRay(px, py);
-				Colour nrm = viewNormals(normalRay);
-				normalBuffer[index + 0] = nrm.r;
-				normalBuffer[index + 1] = nrm.g;
-				normalBuffer[index + 2] = nrm.b;
-			}
-		}
 	}
 	void render()
 	{
@@ -501,7 +566,34 @@ public:
 		//renderST();
 		renderMT();
 		//render_LT();
+
 		if (deNoise) {
+			for (unsigned int y = 0; y < film->height; y++)
+			{
+				for (unsigned int x = 0; x < film->width; x++)
+				{
+					float px = x + 0.5f;
+					float py = y + 0.5f;
+					int index = (y * film->width + x) * 3;
+					Colour col = film->film[y * film->width + x];
+					if (film->SPP > 0) {
+						col = col / (float)film->SPP;
+					}
+					colorBuffer[index + 0] = col.r;
+					colorBuffer[index + 1] = col.g;
+					colorBuffer[index + 2] = col.b;
+					Ray albedoRay = scene->camera.generateRay(px, py);
+					Colour alb = albedo(albedoRay);
+					albedoBuffer[index + 0] = alb.r;
+					albedoBuffer[index + 1] = alb.g;
+					albedoBuffer[index + 2] = alb.b;
+					Ray normalRay = scene->camera.generateRay(px, py);
+					Colour nrm = viewNormals(normalRay);
+					normalBuffer[index + 0] = nrm.r;
+					normalBuffer[index + 1] = nrm.g;
+					normalBuffer[index + 2] = nrm.b;
+				}
+			}
 			denoise();
 		}	
 		for (unsigned int y = 0; y < film->height; y++)
